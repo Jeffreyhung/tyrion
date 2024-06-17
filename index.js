@@ -4,7 +4,7 @@ theme:"theme/urlcool",//Homepage theme, use the empty value for default theme. T
 cors: "on",//Allow Cross-origin resource sharing for API requests.
 unique_link:true,//If it is true, the same long url will be shorten into the same short url
 custom_link:true,//Allow users to customize the short url.
-safe_browsing_api_key: "" //Enter Google Safe Browsing API Key to enable url safety check before redirect.
+safe_browsing_api_key: ${env.safe_browsing_api_key} //Enter Google Safe Browsing API Key to enable url safety check before redirect.
 }
 
 const html404 = `<!DOCTYPE html>
