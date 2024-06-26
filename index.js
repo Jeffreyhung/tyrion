@@ -1,6 +1,6 @@
 const config = {
   no_ref: "on", //Control the HTTP referrer header, if you want to create an anonymous link that will hide the HTTP Referer header, please set to "on" .
-  theme: "theme/urlcool",//Homepage theme, use the empty value for default theme. To use urlcool theme, please fill with "theme/urlcool" .
+  theme: "",//Homepage theme, use the empty value for default theme. To use urlcool theme, please fill with "theme/urlcool" .
   cors: "on",//Allow Cross-origin resource sharing for API requests.
   unique_link: true,//If it is true, the same long url will be shorten into the same short url
   custom_link: true,//Allow users to customize the short url.
