@@ -64,7 +64,7 @@ let res
   $(function () {
     $('[data-toggle="popover"]').popover()
   })
-  console.log("https://github.com/xyTom/Url-Shorten-Worker/")
+  console.log("https://github.com/jeffreyhung/tyrion/")
   let notice="Notice: This service is for demonstration purposes only and the generated short links will automatically expire after 24 hours."
   if(window.location.host=="lnks.eu.org"){
     document.getElementById("notice").innerHTML=notice
