@@ -1,0 +1,47 @@
+name = "tyrion"
+main = "index.js"
+compatibility_date = "2025-09-01"
+
+# Homepage and other static files are served from ./public through env.ASSETS.
+# run_worker_first keeps the worker in charge of routing (short keys never
+# collide with asset paths, and POST / still reaches the API).
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+# Required: the KV namespace that stores short links.
+# Create it with `npx wrangler kv namespace create LINKS` and paste the id here.
+[[kv_namespaces]]
+binding = "LINKS"
+id = "a695fd1c03574330a8046686a81de0cb"
+
+# Optional: throttle link creation per client IP.
+# Uncomment to enable (see https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+# [[ratelimits]]
+# name = "RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 20, period = 60 }
+
+# Non-secret settings. Every value has a sensible default in index.js; only set
+# what you want to change. Booleans are the strings "true" / "false".
+[vars]
+NO_REF = "true"
+CORS = "true"
+UNIQUE_LINK = "true"
+FORWARD_QUERY_PARAMS = "true"
+EXPIRATION_TTL = "0"
+MAX_URL_LENGTH = "2048"
+CAPTCHA_ENABLED = "true"
+CAPTCHA_API_ENDPOINT = "https://captcha.gurl.eu.org/api"
+CAPTCHA_WIDGET_SCRIPT_URL = "https://captcha.gurl.eu.org/cap.min.js"
+CAPTCHA_ASSET_HOSTS = "https://cdn.jsdelivr.net"
+CAPTCHA_REQUIRE_ON_CREATE = "true"
+CAPTCHA_REQUIRE_ON_ACCESS = "false"
+CAPTCHA_TIMEOUT = "5000"
+CAPTCHA_MAX_RETRIES = "2"
+CAPTCHA_FALLBACK_ON_ERROR_CREATE = "false"
+CAPTCHA_FALLBACK_ON_ERROR_ACCESS = "true"
+
+# Secrets are never stored here. Set them with:
+#   npx wrangler secret put SAFE_BROWSING_API_KEY

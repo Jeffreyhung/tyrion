@@ -1,0 +1,17 @@
+{
+  "name": "tyrion",
+  "version": "2.0.0",
+  "description": "URL shortener running on Cloudflare Workers",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^4.131.0"
+  }
+}
