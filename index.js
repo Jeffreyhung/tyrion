@@ -2,12 +2,15 @@
  * Tyrion - a URL shortener running on Cloudflare Workers.
  *
  * Bindings (see wrangler.toml):
- *   LINKS         KV namespace (required)
- *   ASSETS        Static assets from ./public (optional, serves the homepage)
- *   RATE_LIMITER  Rate limiting binding (optional, throttles link creation per IP)
+ *   LINKS              KV namespace (required)
+ *   ASSETS             Static assets from ./public (optional, serves the homepage)
+ *   RATE_LIMITER       Rate limiting binding (optional, hard cap: 429 on link creation)
+ *   CHALLENGE_LIMITER  Rate limiting binding (optional, soft cap: exceeding it makes
+ *                      a request "suspicious" so it must pass a Turnstile challenge)
  *
- * All settings are read from environment variables so nothing sensitive lives in
- * source. See DEFAULTS below for the list and the README for how to set them.
+ * Bot protection uses Cloudflare Turnstile. By default the challenge is only
+ * demanded when a request looks suspicious (see assessRisk). All settings are
+ * read from environment variables so nothing sensitive lives in source.
  */
 
 // ---------------------------------------------------------------------------
@@ -34,25 +37,32 @@ const DEFAULTS = {
   homepage_url: "",
   // Google Safe Browsing API key. Empty disables the check. Set as a secret.
   safe_browsing_api_key: "",
-  captcha: {
-    enabled: true,
-    // Cap server (https://capjs.js.org). Self-host it to remove the third party.
-    api_endpoint: "https://captcha.gurl.eu.org/api",
-    widget_script_url: "https://captcha.gurl.eu.org/cap.min.js",
-    // Extra origins the widget loads code from (space separated). The stock
-    // widget fetches its WebAssembly solver from jsdelivr.
-    asset_hosts: "https://cdn.jsdelivr.net",
-    require_on_create: true,
-    require_on_access: false,
+  // Optional bearer token that lets scripts use the API without a challenge.
+  // Set as a secret; clients send "Authorization: Bearer <token>".
+  api_token: "",
+  challenge: {
+    // Turnstile keys from the Cloudflare dashboard. The site key is public and
+    // ends up in the HTML; the secret key must be a Worker secret.
+    site_key: "",
+    secret_key: "",
+    // "off": never challenge. "suspicious": challenge only when assessRisk
+    // scores the request at or above `threshold`. "always": challenge everyone.
+    on_create: "suspicious",
+    // Access defaults to off because link previews and crawlers following
+    // short links are legitimate automated traffic.
+    on_access: "off",
+    threshold: 3,
+    // Turnstile verification request timeout and retries.
     timeout: 5000,
     max_retries: 2,
-    // When the Cap server cannot be reached: allow the operation anyway?
-    // Creation fails closed by default so an outage does not open the door to
-    // bulk link creation. Access fails open so existing links keep working.
+    // When Turnstile's verification API cannot be reached: allow the operation?
+    // Creation fails closed so an outage cannot be used for bulk creation.
     fallback_on_error_create: false,
     fallback_on_error_access: true,
   },
 };
+
+const MODES = ["off", "suspicious", "always"];
 
 const ENV_MAP = {
   NO_REF: ["no_ref", "bool"],
@@ -64,16 +74,16 @@ const ENV_MAP = {
   KEY_LENGTH: ["key_length", "int"],
   HOMEPAGE_URL: ["homepage_url", "string"],
   SAFE_BROWSING_API_KEY: ["safe_browsing_api_key", "string"],
-  CAPTCHA_ENABLED: ["captcha.enabled", "bool"],
-  CAPTCHA_API_ENDPOINT: ["captcha.api_endpoint", "string"],
-  CAPTCHA_WIDGET_SCRIPT_URL: ["captcha.widget_script_url", "string"],
-  CAPTCHA_ASSET_HOSTS: ["captcha.asset_hosts", "string"],
-  CAPTCHA_REQUIRE_ON_CREATE: ["captcha.require_on_create", "bool"],
-  CAPTCHA_REQUIRE_ON_ACCESS: ["captcha.require_on_access", "bool"],
-  CAPTCHA_TIMEOUT: ["captcha.timeout", "int"],
-  CAPTCHA_MAX_RETRIES: ["captcha.max_retries", "int"],
-  CAPTCHA_FALLBACK_ON_ERROR_CREATE: ["captcha.fallback_on_error_create", "bool"],
-  CAPTCHA_FALLBACK_ON_ERROR_ACCESS: ["captcha.fallback_on_error_access", "bool"],
+  API_TOKEN: ["api_token", "string"],
+  TURNSTILE_SITE_KEY: ["challenge.site_key", "string"],
+  TURNSTILE_SECRET_KEY: ["challenge.secret_key", "string"],
+  CHALLENGE_ON_CREATE: ["challenge.on_create", "mode"],
+  CHALLENGE_ON_ACCESS: ["challenge.on_access", "mode"],
+  SUSPICION_THRESHOLD: ["challenge.threshold", "int"],
+  CHALLENGE_TIMEOUT: ["challenge.timeout", "int"],
+  CHALLENGE_MAX_RETRIES: ["challenge.max_retries", "int"],
+  CHALLENGE_FALLBACK_ON_ERROR_CREATE: ["challenge.fallback_on_error_create", "bool"],
+  CHALLENGE_FALLBACK_ON_ERROR_ACCESS: ["challenge.fallback_on_error_access", "bool"],
 };
 
 function parseBool(value, fallback) {
@@ -92,12 +102,21 @@ function parseInteger(value, fallback) {
   return Number.isFinite(n) ? Math.floor(n) : fallback;
 }
 
+function parseMode(value, fallback) {
+  if (typeof value !== "string") return fallback;
+  const v = value.trim().toLowerCase();
+  if (["off", "false", "0", "no", "never"].includes(v)) return "off";
+  if (["always", "true", "1", "yes", "on"].includes(v)) return "always";
+  if (["suspicious", "auto", "risk", "smart"].includes(v)) return "suspicious";
+  return fallback;
+}
+
 /**
  * Builds the effective configuration from DEFAULTS overlaid with environment
  * variables. Unknown or malformed values fall back to the default.
  */
 export function loadConfig(env = {}) {
-  const cfg = { ...DEFAULTS, captcha: { ...DEFAULTS.captcha } };
+  const cfg = { ...DEFAULTS, challenge: { ...DEFAULTS.challenge } };
   for (const [envName, [path, type]] of Object.entries(ENV_MAP)) {
     if (env[envName] === undefined || env[envName] === null) continue;
     const [head, tail] = path.split(".");
@@ -106,13 +125,19 @@ export function loadConfig(env = {}) {
     const current = target[prop];
     if (type === "bool") target[prop] = parseBool(env[envName], current);
     else if (type === "int") target[prop] = parseInteger(env[envName], current);
+    else if (type === "mode") target[prop] = parseMode(env[envName], current);
     else target[prop] = String(env[envName]);
   }
   cfg.key_length = Math.min(Math.max(cfg.key_length, 4), 32);
   cfg.max_url_length = Math.max(cfg.max_url_length, 32);
-  cfg.captcha.timeout = Math.max(cfg.captcha.timeout, 500);
-  cfg.captcha.max_retries = Math.min(Math.max(cfg.captcha.max_retries, 0), 5);
+  cfg.challenge.threshold = Math.max(cfg.challenge.threshold, 1);
+  cfg.challenge.timeout = Math.max(cfg.challenge.timeout, 500);
+  cfg.challenge.max_retries = Math.min(Math.max(cfg.challenge.max_retries, 0), 5);
   return cfg;
+}
+
+function challengeConfigured(cfg) {
+  return Boolean(cfg.challenge.site_key && cfg.challenge.secret_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +171,17 @@ async function sha512Hex(text) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** Constant-time string comparison for secrets. */
+function safeEqual(a, b) {
+  const enc = new TextEncoder();
+  const x = enc.encode(String(a));
+  const y = enc.encode(String(b));
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
 /** Escapes a string for safe insertion into HTML text or attribute values. */
 export function escapeHtml(value) {
   return String(value)
@@ -166,7 +202,7 @@ export function validateTargetUrl(input, { maxLength = 2048, selfHostname = "" }
   if (raw.length === 0) return { ok: false, error: "url is required" };
   if (raw.length > maxLength) return { ok: false, error: `url is longer than ${maxLength} characters` };
   // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u0020\u007f]/.test(raw)) return { ok: false, error: "url contains whitespace or control characters" };
+  if (/[ - ]/.test(raw)) return { ok: false, error: "url contains whitespace or control characters" };
   // These are invalid in URLs and are what HTML/JS injection payloads rely on.
   if (/[<>"`]/.test(raw)) return { ok: false, error: "url contains characters that are not allowed" };
 
@@ -191,7 +227,7 @@ export function validateTargetUrl(input, { maxLength = 2048, selfHostname = "" }
 /**
  * Appends the query parameters of the short-link request to the destination.
  * The destination's own query string is preserved verbatim; parameters used by
- * this service (the CAPTCHA token) are never forwarded.
+ * this service (the challenge token) are never forwarded.
  */
 export function buildDestination(target, searchParams, { forward = true, strip = ["captcha_token"] } = {}) {
   if (!forward) return target;
@@ -211,8 +247,66 @@ function clientIp(request) {
 }
 
 // ---------------------------------------------------------------------------
+// Risk assessment: decides whether a request looks automated
+// ---------------------------------------------------------------------------
+
+// User-Agent fragments typical of HTTP libraries, CLI tools and headless browsers.
+const AUTOMATION_UA =
+  /curl|wget|python|httpx|aiohttp|go-http-client|okhttp|java\/|libwww|scrapy|node-fetch|undici|axios|postman|insomnia|headless|phantom|puppeteer|playwright|selenium|\bbot\b|spider|crawler/i;
+
+/**
+ * Scores how suspicious a request looks. Each signal adds points; the caller
+ * compares the total against the configured threshold. Signals:
+ *   - Cloudflare Bot Management score (Enterprise plans only; ignored elsewhere)
+ *   - the soft rate limit (CHALLENGE_LIMITER) having been exceeded
+ *   - missing or automation-style User-Agent
+ *   - a browser User-Agent without the Sec-Fetch-* headers every real browser sends
+ *   - missing Accept-Language
+ *   - a JSON POST with neither Origin nor Referer (browsers always send Origin on POST)
+ *   - obsolete TLS
+ * Verified bots (Enterprise Bot Management) score zero.
+ */
+export function assessRisk(request, { operation = "create", softLimited = false } = {}) {
+  const h = request.headers;
+  const cf = request.cf || {};
+  const reasons = [];
+  let score = 0;
+  const add = (points, reason) => {
+    score += points;
+    reasons.push(reason);
+  };
+
+  const bm = cf.botManagement;
+  if (bm && typeof bm === "object") {
+    if (bm.verifiedBot) return { score: 0, reasons: ["verified bot"] };
+    if (typeof bm.score === "number" && bm.score > 0 && bm.score < 30) add(3, `bot score ${bm.score}`);
+  }
+  if (softLimited) add(3, "creation rate exceeded");
+
+  const ua = h.get("user-agent") || "";
+  if (!ua) add(3, "no user-agent");
+  else if (AUTOMATION_UA.test(ua)) add(2, "automation user-agent");
+  if (/Mozilla\/5\.0/.test(ua) && !h.get("sec-fetch-mode")) add(2, "browser user-agent without sec-fetch headers");
+  if (!h.get("accept-language")) add(1, "no accept-language");
+  if (operation === "create" && !h.get("origin") && !h.get("referer")) add(1, "no origin or referer");
+  if (typeof cf.tlsVersion === "string" && /^TLSv1(\.[01])?$/.test(cf.tlsVersion)) add(1, `obsolete ${cf.tlsVersion}`);
+
+  return { score, reasons };
+}
+
+function needsChallenge(mode, risk, cfg) {
+  if (mode === "off") return false;
+  if (mode === "always") return true;
+  return risk.score >= cfg.challenge.threshold;
+}
+
+// ---------------------------------------------------------------------------
 // Responses and headers
 // ---------------------------------------------------------------------------
+
+const TURNSTILE_ORIGIN = "https://challenges.cloudflare.com";
+const TURNSTILE_SCRIPT = `${TURNSTILE_ORIGIN}/turnstile/v0/api.js`;
+const TURNSTILE_VERIFY = `${TURNSTILE_ORIGIN}/turnstile/v0/siteverify`;
 
 const BASE_SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
@@ -224,12 +318,29 @@ const BASE_SECURITY_HEADERS = {
 // Pages fully generated by this worker carry no scripts unless stated otherwise.
 const STRICT_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
+/** CSP for pages that may embed the Turnstile widget. */
+function turnstileCsp(extraScriptSrc = []) {
+  const scriptSrc = ["'self'", "'unsafe-inline'", TURNSTILE_ORIGIN, ...extraScriptSrc].join(" ");
+  return [
+    "default-src 'self'",
+    `script-src ${scriptSrc}`,
+    "style-src 'self' 'unsafe-inline'",
+    "connect-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    `frame-src ${TURNSTILE_ORIGIN}`,
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+}
+
 function corsHeaders(cfg) {
   if (!cfg.cors) return {};
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -271,38 +382,6 @@ function redirectResponse(location, cfg) {
   return new Response(null, { status: 302, headers });
 }
 
-/** CSP for pages that embed the Cap CAPTCHA widget. */
-function captchaCsp(cfg, extraScriptSrc = []) {
-  const widgetOrigin = safeOrigin(cfg.captcha.widget_script_url);
-  const apiOrigin = safeOrigin(cfg.captcha.api_endpoint);
-  const assetHosts = cfg.captcha.asset_hosts.split(/\s+/).map(safeOrigin).filter(Boolean);
-  // The widget's blob: worker inherits this policy and compiles WebAssembly, so
-  // the asset hosts must be allowed for scripts, fetches and the default.
-  const scriptSrc = ["'self'", "'unsafe-inline'", "'wasm-unsafe-eval'", widgetOrigin, ...assetHosts, ...extraScriptSrc].filter(Boolean).join(" ");
-  const connectSrc = ["'self'", apiOrigin, ...assetHosts].filter(Boolean).join(" ");
-  return [
-    `default-src 'self' ${assetHosts.join(" ")}`.trim(),
-    `script-src ${scriptSrc}`,
-    "style-src 'self' 'unsafe-inline'",
-    `connect-src ${connectSrc}`,
-    "worker-src 'self' blob:",
-    "img-src 'self' data:",
-    "font-src 'self' data:",
-    "frame-src https://challenges.cloudflare.com",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "frame-ancestors 'none'",
-  ].join("; ");
-}
-
-function safeOrigin(url) {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return "";
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Page templates (all interpolated values are escaped)
 // ---------------------------------------------------------------------------
@@ -317,6 +396,7 @@ const PAGE_STYLE = `
   a.button { display: inline-block; background: #007aff; color: #fff; text-decoration: none; padding: .6rem 1.2rem; border-radius: 8px; }
   a.button.danger { background: #ff3b30; }
   .url { word-break: break-all; font-family: ui-monospace, monospace; font-size: .9rem; background: #f5f5f7; padding: .75rem; border-radius: 8px; margin-bottom: 1.25rem; }
+  .widget { display: flex; justify-content: center; min-height: 65px; margin: 1rem 0; }
   @media (prefers-color-scheme: dark) { body { background: #000; color: #f5f5f7; } .card { background: #1c1c1e; } .url { background: #2c2c2e; } p { color: #a1a1a6; } }
 `;
 
@@ -356,61 +436,91 @@ function unsafeUrlPage(destination) {
   );
 }
 
-function captchaChallengePage(cfg) {
+function siteKeyForHtml(cfg) {
+  // Turnstile site keys are plain ASCII identifiers; strip anything else.
+  return cfg.challenge.site_key.replace(/[^A-Za-z0-9_-]/g, "");
+}
+
+function challengePage(cfg) {
   const body = `
-<h1>&#128274; Verification required</h1>
-<p>Please complete the check below to continue to the link.</p>
-<cap-widget id="cap" data-cap-api-endpoint="${escapeHtml(cfg.captcha.api_endpoint.replace(/\/?$/, "/"))}"></cap-widget>
+<h1>&#128274; Quick check</h1>
+<p>This link is protected. Please complete the verification to continue.</p>
+<div id="turnstile" class="widget"></div>
 <p id="status" hidden>Verifying and redirecting&hellip;</p>
-<script src="${escapeHtml(cfg.captcha.widget_script_url)}"></script>
+<script src="${TURNSTILE_SCRIPT}?onload=onTurnstileLoad&render=explicit" async defer></script>
 <script>
-  document.getElementById("cap").addEventListener("solve", function (e) {
-    document.getElementById("status").hidden = false;
-    var next = new URL(window.location.href);
-    next.searchParams.set("captcha_token", e.detail.token);
-    window.location.replace(next.href);
-  });
+  function onTurnstileLoad() {
+    turnstile.render("#turnstile", {
+      sitekey: "${siteKeyForHtml(cfg)}",
+      callback: function (token) {
+        document.getElementById("status").hidden = false;
+        var next = new URL(window.location.href);
+        next.searchParams.set("captcha_token", token);
+        window.location.replace(next.href);
+      }
+    });
+  }
 </script>`;
   return page("Verification required", body);
 }
 
-function captchaFailedPage(message, retryPath) {
+function challengeFailedPage(message, retryPath) {
   return page(
     "Verification failed",
     `<h1>&#10060; Verification failed</h1><p>${escapeHtml(message)}</p><a class="button" href="${escapeHtml(retryPath)}">Try again</a>`,
   );
 }
 
+function challengeUnavailablePage() {
+  return page(
+    "Verification unavailable",
+    `<h1>Verification unavailable</h1><p>This link requires a verification step that is not configured. Please try again later.</p>`,
+  );
+}
+
 /** Minimal homepage used when neither ASSETS nor HOMEPAGE_URL is configured. */
 function fallbackHomepage(cfg) {
-  const widget = cfg.captcha.enabled && cfg.captcha.require_on_create
-    ? `<cap-widget id="cap" data-cap-api-endpoint="${escapeHtml(cfg.captcha.api_endpoint.replace(/\/?$/, "/"))}"></cap-widget>
-<script src="${escapeHtml(cfg.captcha.widget_script_url)}"></script>`
-    : "";
   const body = `
 <h1>Tyrion URL Shortener</h1>
 <form id="f">
   <p><input id="url" type="url" required placeholder="https://example.com/very/long/link" style="width:100%;padding:.6rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box"></p>
-  ${widget}
+  <div id="turnstile" class="widget" hidden></div>
   <p><button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:#007aff;color:#fff">Shorten</button></p>
 </form>
 <p id="out"></p>
 <script>
-  var token = null;
-  var cap = document.getElementById("cap");
-  if (cap) cap.addEventListener("solve", function (e) { token = e.detail.token; });
-  document.getElementById("f").addEventListener("submit", async function (e) {
-    e.preventDefault();
+  var SITE_KEY = "${siteKeyForHtml(cfg)}";
+  var token = null, widgetId = null, pending = null;
+  function loadTurnstile() {
+    return new Promise(function (resolve, reject) {
+      if (window.turnstile) return resolve();
+      var s = document.createElement("script");
+      s.src = "${TURNSTILE_SCRIPT}?render=explicit";
+      s.async = true; s.onload = resolve; s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+  async function challenge() {
+    var box = document.getElementById("turnstile");
+    box.hidden = false;
+    await loadTurnstile();
+    if (widgetId !== null) { turnstile.reset(widgetId); return; }
+    widgetId = turnstile.render(box, { sitekey: SITE_KEY, callback: function (t) { token = t; submit(pending); } });
+  }
+  async function submit(url) {
     var out = document.getElementById("out");
     out.textContent = "Working...";
     try {
       var res = await fetch("/", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: document.getElementById("url").value, captcha_token: token }) });
+        body: JSON.stringify({ url: url, captcha_token: token }) });
       var data = await res.json();
+      token = null;
       if (data.status === 200) { out.textContent = ""; var a = document.createElement("a"); a.href = data.key; a.textContent = location.origin + data.key; out.appendChild(a); }
-      else { out.textContent = data.error || "Request failed"; if (cap && cap.reset) cap.reset(); token = null; }
+      else if (data.captcha_required) { pending = url; out.textContent = "Please complete the check below."; challenge(); }
+      else { out.textContent = data.error || "Request failed"; }
     } catch (err) { out.textContent = "Network error"; }
-  });
+  }
+  document.getElementById("f").addEventListener("submit", function (e) { e.preventDefault(); submit(document.getElementById("url").value); });
 </script>`;
   return page("Tyrion URL Shortener", body);
 }
@@ -420,32 +530,39 @@ function fallbackHomepage(cfg) {
 // ---------------------------------------------------------------------------
 
 /**
- * Validates a Cap token. Returns { success, degraded, error? }.
- * `fallback` decides what happens when the Cap server cannot be reached.
+ * Verifies a Turnstile token with Cloudflare. Returns { success, degraded, error? }.
+ * `fallback` decides what happens when the verification API cannot be reached.
  */
-export async function validateCaptchaToken(token, cfg, { fallback = false, fetchImpl = fetch } = {}) {
-  if (!cfg.captcha.enabled) return { success: true, degraded: false };
-  if (!token || typeof token !== "string" || token.length < 10 || token.length > 512) {
+export async function verifyTurnstile(token, cfg, { remoteip = "", fallback = false, fetchImpl = fetch } = {}) {
+  if (!token || typeof token !== "string" || token.length < 10 || token.length > 2048) {
     return { success: false, degraded: false, error: "Invalid token format" };
+  }
+  if (!cfg.challenge.secret_key) {
+    return { success: false, degraded: false, error: "Verification is not configured" };
   }
 
   let lastError = null;
-  for (let attempt = 0; attempt <= cfg.captcha.max_retries; attempt++) {
+  for (let attempt = 0; attempt <= cfg.challenge.max_retries; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), cfg.captcha.timeout);
+    const timer = setTimeout(() => controller.abort(), cfg.challenge.timeout);
     try {
-      const response = await fetchImpl(`${cfg.captcha.api_endpoint.replace(/\/$/, "")}/validate`, {
+      const response = await fetchImpl(TURNSTILE_VERIFY, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "User-Agent": "Tyrion-Url-Shortener/2.0" },
-        body: JSON.stringify({ token, keepToken: false }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret: cfg.challenge.secret_key, response: token, remoteip: remoteip || undefined }),
         signal: controller.signal,
       });
       if (response.ok) {
         const result = await response.json().catch(() => ({}));
-        return { success: result.success === true, degraded: false, error: result.success === true ? undefined : "Invalid or expired token" };
-      }
-      if ([400, 401, 403, 404, 409, 410].includes(response.status)) {
-        return { success: false, degraded: false, error: "Invalid or expired token" };
+        if (result.success === true) return { success: true, degraded: false };
+        const codes = Array.isArray(result["error-codes"]) ? result["error-codes"] : [];
+        // A bad secret is our misconfiguration, not the visitor's fault.
+        if (codes.some((c) => /secret/.test(c))) {
+          lastError = `misconfigured: ${codes.join(",")}`;
+          console.error(`Turnstile ${lastError}`);
+          break;
+        }
+        return { success: false, degraded: false, error: "Verification failed or expired, please try again" };
       }
       lastError = `HTTP ${response.status}`;
     } catch (error) {
@@ -453,17 +570,17 @@ export async function validateCaptchaToken(token, cfg, { fallback = false, fetch
     } finally {
       clearTimeout(timer);
     }
-    console.error(`CAPTCHA validation attempt ${attempt + 1} failed: ${lastError}`);
-    if (attempt < cfg.captcha.max_retries) {
+    console.error(`Turnstile verification attempt ${attempt + 1} failed: ${lastError}`);
+    if (attempt < cfg.challenge.max_retries) {
       await new Promise((resolve) => setTimeout(resolve, 2 ** attempt * 100));
     }
   }
 
   if (fallback) {
-    console.warn(`CAPTCHA service degraded (${lastError}); allowing operation per fallback policy`);
+    console.warn(`Turnstile degraded (${lastError}); allowing operation per fallback policy`);
     return { success: true, degraded: true };
   }
-  return { success: false, degraded: false, error: "CAPTCHA service unavailable, please try again later" };
+  return { success: false, degraded: false, error: "Verification service unavailable, please try again later" };
 }
 
 /** Google Safe Browsing lookup. Returns { safe, error? }; errors fail open. */
@@ -536,6 +653,13 @@ async function storeUrl(env, cfg, url) {
 // Request handlers
 // ---------------------------------------------------------------------------
 
+function hasApiToken(request, cfg) {
+  if (!cfg.api_token) return false;
+  const auth = request.headers.get("Authorization") || "";
+  const match = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  return Boolean(match && safeEqual(match[1], cfg.api_token));
+}
+
 async function handleCreate(request, env, cfg) {
   if (env.RATE_LIMITER) {
     const { success } = await env.RATE_LIMITER.limit({ key: clientIp(request) });
@@ -548,7 +672,7 @@ async function handleCreate(request, env, cfg) {
   } catch {
     return jsonResponse({ status: 400, error: "Request body must be JSON" }, 400, cfg);
   }
-  if (!body || typeof body !== "object") {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
     return jsonResponse({ status: 400, error: "Request body must be a JSON object" }, 400, cfg);
   }
 
@@ -556,14 +680,28 @@ async function handleCreate(request, env, cfg) {
   const check = validateTargetUrl(body.url, { maxLength: cfg.max_url_length, selfHostname: requestUrl.hostname });
   if (!check.ok) return jsonResponse({ status: 400, error: check.error }, 400, cfg);
 
-  if (cfg.captcha.enabled && cfg.captcha.require_on_create) {
-    const token = body.captcha_token || body.captchaToken || body.token;
-    if (!token) {
-      return jsonResponse({ status: 403, error: "CAPTCHA token required", captcha_required: true }, 403, cfg);
+  const mode = cfg.challenge.on_create;
+  if (mode !== "off" && !hasApiToken(request, cfg)) {
+    let softLimited = false;
+    if (env.CHALLENGE_LIMITER) {
+      softLimited = !(await env.CHALLENGE_LIMITER.limit({ key: clientIp(request) })).success;
     }
-    const validation = await validateCaptchaToken(token, cfg, { fallback: cfg.captcha.fallback_on_error_create });
-    if (!validation.success) {
-      return jsonResponse({ status: 403, error: validation.error || "CAPTCHA verification failed", captcha_required: true }, 403, cfg);
+    const risk = assessRisk(request, { operation: "create", softLimited });
+    if (needsChallenge(mode, risk, cfg)) {
+      const why = risk.reasons.join(", ") || "policy";
+      if (!challengeConfigured(cfg)) {
+        console.error(`Challenge required (${why}) but TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY are not set`);
+        return jsonResponse({ status: 503, error: "Verification is required but not configured on this server" }, 503, cfg);
+      }
+      const token = body.captcha_token || body.turnstile_token || body["cf-turnstile-response"];
+      if (!token) {
+        console.log(`Challenge demanded for create (${why})`);
+        return jsonResponse({ status: 403, error: "Verification required", captcha_required: true }, 403, cfg);
+      }
+      const verdict = await verifyTurnstile(token, cfg, { remoteip: clientIp(request), fallback: cfg.challenge.fallback_on_error_create });
+      if (!verdict.success) {
+        return jsonResponse({ status: 403, error: verdict.error || "Verification failed", captcha_required: true }, 403, cfg);
+      }
     }
   }
 
@@ -587,37 +725,30 @@ async function handleCreate(request, env, cfg) {
 
 async function serveHomepage(request, env, cfg) {
   const headers = {
-    "Content-Security-Policy": captchaCsp(cfg, ["https://cdn.tailwindcss.com"]),
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy": turnstileCsp(["https://cdn.tailwindcss.com"]),
     "Cache-Control": "public, max-age=300",
     ...BASE_SECURITY_HEADERS,
   };
+  // The homepage template carries a placeholder for the public Turnstile site key.
+  const inject = (html) => html.replace(/\{\{TURNSTILE_SITE_KEY\}\}/g, siteKeyForHtml(cfg));
 
   if (env.ASSETS) {
     const asset = await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), { method: "GET" }));
-    if (asset.ok) {
-      const res = new Response(asset.body, asset);
-      for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
-      return res;
-    }
+    if (asset.ok) return new Response(inject(await asset.text()), { headers });
   }
 
   if (cfg.homepage_url && cfg.homepage_url.startsWith("https://")) {
     try {
       const upstream = await fetch(cfg.homepage_url, { cf: { cacheTtl: 300, cacheEverything: true } });
-      if (upstream.ok) {
-        return new Response(await upstream.text(), {
-          headers: { "Content-Type": "text/html; charset=utf-8", ...headers },
-        });
-      }
+      if (upstream.ok) return new Response(inject(await upstream.text()), { headers });
       console.error(`Homepage fetch failed: HTTP ${upstream.status}`);
     } catch (error) {
       console.error(`Homepage fetch failed: ${error && error.message}`);
     }
   }
 
-  return new Response(fallbackHomepage(cfg), {
-    headers: { "Content-Type": "text/html; charset=utf-8", ...headers, "Cache-Control": "no-store" },
-  });
+  return new Response(fallbackHomepage(cfg), { headers: { ...headers, "Cache-Control": "no-store" } });
 }
 
 async function handleAccess(request, env, cfg) {
@@ -639,16 +770,25 @@ async function handleAccess(request, env, cfg) {
     return htmlResponse(notFoundPage(), 404);
   }
 
-  if (cfg.captcha.enabled && cfg.captcha.require_on_access) {
-    const token = requestUrl.searchParams.get("captcha_token");
-    const challengeHeaders = { "Content-Security-Policy": captchaCsp(cfg) };
-    if (!token) return htmlResponse(captchaChallengePage(cfg), 403, challengeHeaders);
-
-    const validation = await validateCaptchaToken(token, cfg, { fallback: cfg.captcha.fallback_on_error_access });
-    if (!validation.success) {
-      const retry = new URL(requestUrl.href);
-      retry.searchParams.delete("captcha_token");
-      return htmlResponse(captchaFailedPage(validation.error || "CAPTCHA verification failed", retry.pathname + retry.search), 403);
+  const mode = cfg.challenge.on_access;
+  if (mode !== "off") {
+    const risk = assessRisk(request, { operation: "access" });
+    if (needsChallenge(mode, risk, cfg)) {
+      if (!challengeConfigured(cfg)) {
+        console.error("Challenge required for access but TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY are not set");
+        return htmlResponse(challengeUnavailablePage(), 503);
+      }
+      const token = requestUrl.searchParams.get("captcha_token");
+      if (!token) {
+        console.log(`Challenge demanded for access to ${key} (${risk.reasons.join(", ") || "policy"})`);
+        return htmlResponse(challengePage(cfg), 403, { "Content-Security-Policy": turnstileCsp() });
+      }
+      const verdict = await verifyTurnstile(token, cfg, { remoteip: clientIp(request), fallback: cfg.challenge.fallback_on_error_access });
+      if (!verdict.success) {
+        const retry = new URL(requestUrl.href);
+        retry.searchParams.delete("captcha_token");
+        return htmlResponse(challengeFailedPage(verdict.error || "Verification failed", retry.pathname + retry.search), 403);
+      }
     }
   }
 

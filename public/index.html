@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="description" content="Fast, Secure, and Reliable URL Shortening Service">
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://captcha.gurl.eu.org/cap.min.js"></script>
   <title>Tyrion</title>
   <script>
     tailwind.config = {
@@ -92,18 +91,6 @@
       #submitBtn span {
         white-space: nowrap;
       }
-      
-      /* CAPTCHA widget 缩放 */
-      cap-widget {
-        transform: scale(0.9);
-        transform-origin: center center;
-      }
-    }
-    
-    @media (max-width: 420px) {
-      cap-widget {
-        transform: scale(0.85);
-      }
     }
   </style>
 </head>
@@ -161,7 +148,7 @@
     <div class="absolute inset-0 bg-black/50 glass animate-fade-in" onclick="closeModal('captchaModal')"></div>
     <div class="relative w-full max-w-md bg-white dark:bg-gray-900 rounded-2xl shadow-2xl animate-scale-up">
       <div class="flex items-center justify-between px-5 sm:px-6 py-4 sm:py-5 border-b border-gray-200 dark:border-gray-800">
-        <h2 class="text-base sm:text-lg font-semibold">CAPTCHA Verification</h2>
+        <h2 class="text-base sm:text-lg font-semibold">Quick check</h2>
         <button 
           type="button" 
           onclick="closeModal('captchaModal')" 
@@ -173,14 +160,9 @@
       </div>
       <div class="p-5 sm:p-6">
         <p class="text-xs sm:text-sm text-apple-gray dark:text-gray-400 text-center mb-5">
-          Please complete the CAPTCHA to continue
+          Please complete the verification to continue
         </p>
-        <div class="flex justify-center">
-          <cap-widget 
-            id="capWidget" 
-            data-cap-api-endpoint="https://captcha.gurl.eu.org/api/">
-          </cap-widget>
-        </div>
+        <div id="turnstileWidget" class="flex justify-center min-h-[65px]"></div>
       </div>
     </div>
   </div>
@@ -223,9 +205,14 @@
   </div>
 
   <script>
+    // Public Turnstile site key, injected by the worker when serving this page.
+    const TURNSTILE_SITE_KEY = "{{TURNSTILE_SITE_KEY}}";
+    const TURNSTILE_SCRIPT = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
     // State Management
     const state = {
       captchaToken: null,
+      turnstileWidgetId: null,
       isProcessing: false,
       pendingUrl: null,
       generatedUrl: null
@@ -240,43 +227,11 @@
       captchaModal: document.getElementById('captchaModal'),
       resultModal: document.getElementById('resultModal'),
       resultUrl: document.getElementById('resultUrl'),
-      capWidget: document.getElementById('capWidget')
+      turnstileWidget: document.getElementById('turnstileWidget')
     };
 
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
-      // Setup CAPTCHA listeners
-      if (elements.capWidget) {
-        // CAPTCHA solved successfully
-        elements.capWidget.addEventListener('solve', (e) => {
-          state.captchaToken = e.detail.token;
-          console.log('✅ CAPTCHA verified');
-          closeModal('captchaModal');
-          
-          if (state.pendingUrl) {
-            performShortening(state.pendingUrl);
-            state.pendingUrl = null;
-          }
-        });
-
-        // CAPTCHA error
-        elements.capWidget.addEventListener('error', (e) => {
-          console.error('❌ CAPTCHA error:', e.detail);
-          showNotice('CAPTCHA verification failed. Please try again.', 'error');
-        });
-
-        // CAPTCHA reset
-        elements.capWidget.addEventListener('reset', () => {
-          console.log('🔄 CAPTCHA reset');
-          state.captchaToken = null;
-        });
-
-        // CAPTCHA progress (optional: for debugging)
-        elements.capWidget.addEventListener('progress', (e) => {
-          console.log('⏳ CAPTCHA progress:', e.detail);
-        });
-      }
-
       // Input validation
       elements.input.addEventListener('input', () => {
         const value = elements.input.value.trim();
@@ -332,12 +287,6 @@
       elements.input.classList.remove('border-apple-red');
       clearNotice();
 
-      if (!state.captchaToken) {
-        state.pendingUrl = url;
-        openModal('captchaModal');
-        return;
-      }
-
       performShortening(url);
     }
 
@@ -352,10 +301,9 @@
         const response = await fetch(window.location.origin, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: url,
-            captcha_token: state.captchaToken
-          })
+          body: JSON.stringify(
+            state.captchaToken ? { url: url, captcha_token: state.captchaToken } : { url: url }
+          )
         });
 
         const data = await response.json();
@@ -373,14 +321,14 @@
             openModal('resultModal');
             clearNotice();
           }, 500);
+        } else if (data.captcha_required) {
+          // The server decided this request needs a Turnstile check.
+          resetCaptcha();
+          state.pendingUrl = url;
+          await requestChallenge();
         } else {
-          const errorMsg = data.error || 'Unknown error occurred';
-          showNotice(errorMsg, 'error');
-          
-          // Reset CAPTCHA if verification failed
-          if (data.captcha_required || errorMsg.toLowerCase().includes('captcha')) {
-            resetCaptcha();
-          }
+          showNotice(data.error || 'Unknown error occurred', 'error');
+          resetCaptcha();
         }
       } catch (error) {
         console.error('Request failed:', error);
@@ -393,19 +341,55 @@
       }
     }
 
-    // Reset CAPTCHA
+    // Turnstile: loaded and rendered only when the server asks for a check.
+    function loadTurnstile() {
+      return new Promise((resolve, reject) => {
+        if (window.turnstile) return resolve();
+        const script = document.createElement('script');
+        script.src = TURNSTILE_SCRIPT;
+        script.async = true;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error('Could not load the verification widget'));
+        document.head.appendChild(script);
+      });
+    }
+
+    async function requestChallenge() {
+      if (!TURNSTILE_SITE_KEY) {
+        showNotice('Verification is required but not configured on this server.', 'error');
+        return;
+      }
+      openModal('captchaModal');
+      try {
+        await loadTurnstile();
+      } catch (error) {
+        closeModal('captchaModal');
+        showNotice(error.message, 'error');
+        return;
+      }
+      if (state.turnstileWidgetId !== null) {
+        turnstile.reset(state.turnstileWidgetId);
+        return;
+      }
+      state.turnstileWidgetId = turnstile.render(elements.turnstileWidget, {
+        sitekey: TURNSTILE_SITE_KEY,
+        callback: (token) => {
+          state.captchaToken = token;
+          closeModal('captchaModal');
+          if (state.pendingUrl) {
+            const url = state.pendingUrl;
+            state.pendingUrl = null;
+            performShortening(url);
+          }
+        },
+        'error-callback': () => showNotice('Verification failed. Please try again.', 'error'),
+        'expired-callback': () => { state.captchaToken = null; }
+      });
+    }
+
+    // Forget the current token; Turnstile tokens are single-use.
     function resetCaptcha() {
       state.captchaToken = null;
-      
-      // Trigger reset event on widget if available
-      if (elements.capWidget && typeof elements.capWidget.reset === 'function') {
-        try {
-          elements.capWidget.reset();
-          console.log('🔄 CAPTCHA widget reset');
-        } catch (error) {
-          console.warn('Failed to reset CAPTCHA widget:', error);
-        }
-      }
     }
 
     // Copy to Clipboard

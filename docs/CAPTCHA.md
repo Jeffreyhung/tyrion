@@ -1,80 +1,101 @@
-# CAPTCHA integration
+# Bot protection with Cloudflare Turnstile
 
 [简体中文](CAPTCHA_zh-hans.md)
 
-Tyrion uses [Cap](https://capjs.js.org), a proof-of-work CAPTCHA. Visitors solve a small computational puzzle in the browser and receive a token; the Worker validates that token against the Cap server before creating a link or, optionally, before following one.
+Tyrion uses [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) to keep bots from mass-creating links. By default the challenge is **adaptive**: ordinary visitors never see it, and only requests that look automated have to pass it.
 
-Proof-of-work makes automated abuse **expensive**, not impossible. Pair it with the rate limiter binding described in the README for real protection.
+## How "suspicious" is decided
 
-## Configuration
+Every link creation (and, if enabled, every link visit) gets a risk score. Points come from:
 
-All settings are environment variables (see [`wrangler.toml`](../wrangler.toml) or the Worker's dashboard settings).
+| Signal | Points |
+| --- | :---: |
+| Cloudflare Bot Management score below 30 (Enterprise plans only, ignored elsewhere) | 3 |
+| The soft rate limit `CHALLENGE_LIMITER` exceeded for this IP | 3 |
+| No `User-Agent` header | 3 |
+| `User-Agent` of an HTTP library, CLI tool or headless browser (curl, python, Go, axios, puppeteer, ...) | 2 |
+| A browser `User-Agent` without the `Sec-Fetch-*` headers real browsers always send | 2 |
+| No `Accept-Language` header | 1 |
+| A JSON POST with neither `Origin` nor `Referer` (browsers always send `Origin` on POST) | 1 |
+| TLS 1.0 or 1.1 | 1 |
+
+A request scoring at least `SUSPICION_THRESHOLD` (default 3) must present a Turnstile token. Verified bots reported by Bot Management always score zero. The score and reasons are logged whenever a challenge is demanded, so you can tune the threshold from Workers Logs.
+
+Without the `CHALLENGE_LIMITER` binding, a well-behaved script that mimics browser headers can create links at volume. Enable the binding in `wrangler.toml` to close that gap: after the configured number of creations per minute, every further request from that IP is challenged.
+
+## Setup
+
+1. In the Cloudflare dashboard open **Turnstile** and add a widget for your shortener's hostname. The **Managed** widget type is recommended. Add `localhost` too if you want to test real keys locally.
+2. Put the **site key** in `wrangler.toml` as `TURNSTILE_SITE_KEY` (it is public and ends up in the page).
+3. Store the **secret key** as a Worker secret:
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET_KEY
+```
+
+4. Deploy. If a challenge is ever required while the keys are missing, the request is refused with HTTP 503 and an error is logged, so a misconfiguration is visible rather than silently open.
+
+For local development, `.dev.vars` (git-ignored) can hold Cloudflare's test keys, which always pass:
+
+```
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+```
+
+## Settings
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CAPTCHA_ENABLED` | `true` | Master switch. |
-| `CAPTCHA_API_ENDPOINT` | `https://captcha.gurl.eu.org/api` | Cap server API used for validation. |
-| `CAPTCHA_WIDGET_SCRIPT_URL` | `https://captcha.gurl.eu.org/cap.min.js` | Widget script for the challenge pages. |
-| `CAPTCHA_ASSET_HOSTS` | `https://cdn.jsdelivr.net` | Extra origins the Content Security Policy allows for widget code. |
-| `CAPTCHA_REQUIRE_ON_CREATE` | `true` | Require a token to create links. |
-| `CAPTCHA_REQUIRE_ON_ACCESS` | `false` | Require a token to follow links. |
-| `CAPTCHA_TIMEOUT` | `5000` | Validation request timeout in milliseconds. |
-| `CAPTCHA_MAX_RETRIES` | `2` | Retries on network errors or 5xx responses (0–5). |
-| `CAPTCHA_FALLBACK_ON_ERROR_CREATE` | `false` | Allow creation when the Cap server is unreachable. |
-| `CAPTCHA_FALLBACK_ON_ERROR_ACCESS` | `true` | Allow access when the Cap server is unreachable. |
+| `TURNSTILE_SITE_KEY` | empty | Public widget key. |
+| `TURNSTILE_SECRET_KEY` | empty | Secret. Set with `wrangler secret put`. |
+| `CHALLENGE_ON_CREATE` | `suspicious` | `off`, `suspicious` or `always`. |
+| `CHALLENGE_ON_ACCESS` | `off` | Same values, for following links. Off by default because link previews and crawlers are legitimate automated visitors. |
+| `SUSPICION_THRESHOLD` | `3` | Score at which a request is challenged in `suspicious` mode. |
+| `CHALLENGE_TIMEOUT` | `5000` | Verification request timeout in milliseconds. |
+| `CHALLENGE_MAX_RETRIES` | `2` | Retries on network errors or 5xx responses (0–5). |
+| `CHALLENGE_FALLBACK_ON_ERROR_CREATE` | `false` | Allow creation when Cloudflare's verification API is unreachable. |
+| `CHALLENGE_FALLBACK_ON_ERROR_ACCESS` | `true` | Allow access when the verification API is unreachable. |
+| `API_TOKEN` | empty | Optional secret. Requests carrying `Authorization: Bearer <token>` skip the challenge entirely. |
 
-### Scenarios
+## What the visitor sees
 
-**Default:** CAPTCHA on creation only. An outage of the Cap server blocks new links but existing links keep working.
+The homepage submits the URL first. If the server answers `403` with `captcha_required: true`, the page loads the Turnstile script on demand, shows the widget in a dialog, and resubmits with the token once it is solved. Visitors that are not suspicious never load any Turnstile code.
 
-**Strict:** set `CAPTCHA_REQUIRE_ON_ACCESS=true` and `CAPTCHA_FALLBACK_ON_ERROR_ACCESS=false`. Every visit needs a solved challenge, and nothing is allowed while the Cap server is down.
+When `CHALLENGE_ON_ACCESS` demands a check, `GET /<key>` returns a `403` page with the widget. After solving, the page reloads itself with `?captcha_token=...`; the Worker verifies the token, strips it from the forwarded query string, and redirects.
 
-**Access protection only:** set `CAPTCHA_REQUIRE_ON_CREATE=false` and `CAPTCHA_REQUIRE_ON_ACCESS=true`.
+## Scripts and integrations
 
-**Disabled:** set `CAPTCHA_ENABLED=false`.
+Scripts cannot solve Turnstile, and their requests usually score as suspicious. Give them the API token instead:
 
-## Self-hosting the Cap server
-
-The default endpoint is a public third-party service. Anyone operating it, or anyone who can make it unreachable, affects your shortener. Deploy your own [Cap server](https://capjs.js.org/guide/server.html) and point `CAPTCHA_API_ENDPOINT` and `CAPTCHA_WIDGET_SCRIPT_URL` at it. Update the two hardcoded URLs in [`public/index.html`](../public/index.html) as well.
-
-## Creating a link with a token
-
-Browser page using the widget:
-
-```html
-<script src="https://captcha.gurl.eu.org/cap.min.js"></script>
-<cap-widget id="cap" data-cap-api-endpoint="https://captcha.gurl.eu.org/api/"></cap-widget>
-<script>
-  document.getElementById("cap").addEventListener("solve", async (e) => {
-    const res = await fetch("https://your-worker.workers.dev/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: "https://example.com", captcha_token: e.detail.token }),
-    });
-    console.log(await res.json());
-  });
-</script>
+```bash
+npx wrangler secret put API_TOKEN
 ```
 
-Tokens are single-use and expire; obtain a fresh one for every request.
+```bash
+curl -X POST https://your-worker.workers.dev/ \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/very/long/url"}'
+```
 
-## How validation behaves
+A browser page on another origin can also pass a token it obtained from its own Turnstile widget, as long as that widget uses the same site key and hostname allowlist. Send it as `captcha_token`, `turnstile_token` or `cf-turnstile-response`.
 
-1. Tokens shorter than 10 or longer than 512 characters are rejected without contacting the server.
-2. The Worker calls `POST <endpoint>/validate` with `{ token, keepToken: false }`.
-3. `200` with `success: true` passes. `200` with `success: false` and the client errors `400`, `401`, `403`, `404`, `409`, `410` fail immediately.
-4. Other statuses, timeouts and network errors are retried with exponential backoff (100 ms, 200 ms, 400 ms).
-5. When all attempts fail, the relevant fallback setting decides. The outcome is logged as a warning so you can alert on degradation.
+## Verification details
 
-## Access flow
+1. Tokens shorter than 10 or longer than 2048 characters are rejected without a network call.
+2. The Worker posts `{ secret, response, remoteip }` to `https://challenges.cloudflare.com/turnstile/v0/siteverify`.
+3. `success: true` passes. `success: false` with visitor-side error codes (expired, duplicate, invalid) fails immediately.
+4. An `invalid-input-secret` response is logged as a misconfiguration and follows the fallback setting.
+5. Network errors and 5xx responses are retried with exponential backoff, then the fallback setting decides.
 
-When `CAPTCHA_REQUIRE_ON_ACCESS` is on, `GET /<key>` first returns a `403` page with the widget. After solving, the page reloads itself with `?captcha_token=...`; the Worker validates the token, strips it from the forwarded query string, and redirects. A failed validation shows a retry page that preserves the original query parameters.
+Turnstile tokens are single-use and expire after five minutes.
 
 ## Logging
 
 ```
-CAPTCHA validation attempt 1 failed: Timeout
-CAPTCHA service degraded (HTTP 503); allowing operation per fallback policy
+Challenge demanded for create (automation user-agent, no accept-language, no origin or referer)
+Turnstile verification attempt 1 failed: Timeout
+Turnstile degraded (HTTP 503); allowing operation per fallback policy
 ```
 
-Watch for the second line in Workers Logs. Frequent occurrences mean the Cap server is unhealthy or `CAPTCHA_TIMEOUT` is too low.
+Frequent "Challenge demanded" lines for real users mean the threshold is too low. Frequent "degraded" lines mean the verification API is unhealthy or `CHALLENGE_TIMEOUT` is too short.

@@ -15,14 +15,22 @@
 ```json
 {
   "url": "https://example.com/some/long/path",
-  "captcha_token": "Cap 验证组件返回的 token"
+  "captcha_token": "Turnstile token，仅在服务器要求时提供"
 }
 ```
 
 | 参数名 | 类型 | 是否必须 | 说明 |
 | :---: | :---: | :---: | --- |
 | `url` | string | 必须 | 以 `http://` 或 `https://` 开头的完整网址，长度不超过 `MAX_URL_LENGTH`（默认 2048）。含有空白字符、控制字符、`<`、`>`、`"`、`` ` ``、用户名密码，或指向本服务自身的网址会被拒绝。 |
-| `captcha_token` | string | 开启 `CAPTCHA_REQUIRE_ON_CREATE` 时必须（默认开启） | 已通过验证的 Cap token，也可使用 `captchaToken` 或 `token` 字段名。详见[验证码文档](CAPTCHA_zh-hans.md)。 |
+| `captcha_token` | string | 仅在收到带 `captcha_required` 的 `403` 之后 | 已通过的 Cloudflare Turnstile token，也可使用 `turnstile_token` 或 `cf-turnstile-response` 字段名。详见[机器人防护文档](CAPTCHA_zh-hans.md)。 |
+
+### 脚本认证
+
+脚本和 HTTP 库发出的请求通常会被判定为可疑并要求 Turnstile token，而脚本无法完成验证。若运营者配置了 `API_TOKEN`，以 bearer 方式携带即可跳过验证：
+
+```
+Authorization: Bearer YOUR_API_TOKEN
+```
 
 ### 成功响应
 
@@ -49,14 +57,15 @@
 | HTTP | 含义 |
 | :---: | --- |
 | `400` | 请求体不是 JSON、`url` 缺失或无效、或被 Safe Browsing 标记为危险。 |
-| `403` | 缺少或无效的验证码 token，响应中包含 `"captcha_required": true`。 |
+| `403` | 请求疑似自动化，必须附带有效的 Turnstile token，响应中包含 `"captcha_required": true`。 |
 | `429` | 超出频率限制（仅在配置了 `RATE_LIMITER` 绑定时出现）。 |
 | `500` | 链接保存失败。 |
+| `503` | 需要验证但服务器未配置 Turnstile。 |
 
 ```json
 {
   "status": 403,
-  "error": "CAPTCHA token required",
+  "error": "Verification required",
   "captcha_required": true
 }
 ```
@@ -73,6 +82,7 @@
 
 ```bash
 curl -X POST https://url.example.workers.dev/ \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/very/long/url", "captcha_token": "..."}'
+  -d '{"url": "https://example.com/very/long/url"}'
 ```

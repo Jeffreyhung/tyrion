@@ -16,12 +16,20 @@ run_worker_first = true
 binding = "LINKS"
 id = "a695fd1c03574330a8046686a81de0cb"
 
-# Optional: throttle link creation per client IP.
-# Uncomment to enable (see https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+# Optional but recommended: soft limit on link creation per client IP. Going
+# over it does not block the request, it marks it "suspicious" so the visitor
+# has to pass a Turnstile challenge. See
+# https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+[[ratelimits]]
+name = "CHALLENGE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
+
+# Optional: hard cap on link creation per client IP (HTTP 429 when exceeded).
 # [[ratelimits]]
 # name = "RATE_LIMITER"
-# namespace_id = "1001"
-# simple = { limit = 20, period = 60 }
+# namespace_id = "1002"
+# simple = { limit = 30, period = 60 }
 
 # Non-secret settings. Every value has a sensible default in index.js; only set
 # what you want to change. Booleans are the strings "true" / "false".
@@ -32,16 +40,29 @@ UNIQUE_LINK = "true"
 FORWARD_QUERY_PARAMS = "true"
 EXPIRATION_TTL = "0"
 MAX_URL_LENGTH = "2048"
-CAPTCHA_ENABLED = "true"
-CAPTCHA_API_ENDPOINT = "https://captcha.gurl.eu.org/api"
-CAPTCHA_WIDGET_SCRIPT_URL = "https://captcha.gurl.eu.org/cap.min.js"
-CAPTCHA_ASSET_HOSTS = "https://cdn.jsdelivr.net"
-CAPTCHA_REQUIRE_ON_CREATE = "true"
-CAPTCHA_REQUIRE_ON_ACCESS = "false"
-CAPTCHA_TIMEOUT = "5000"
-CAPTCHA_MAX_RETRIES = "2"
-CAPTCHA_FALLBACK_ON_ERROR_CREATE = "false"
-CAPTCHA_FALLBACK_ON_ERROR_ACCESS = "true"
+
+# Turnstile site key (public). Create a widget at
+# https://dash.cloudflare.com/?to=/:account/turnstile with your shortener's
+# hostname, then paste its site key here. The matching secret key is set with
+# `npx wrangler secret put TURNSTILE_SECRET_KEY`.
+TURNSTILE_SITE_KEY = "0x4AAAAAAEv0Z59ZnojRrNoE"
+
+# When to demand a Turnstile challenge: "off", "suspicious" or "always".
+CHALLENGE_ON_CREATE = "suspicious"
+CHALLENGE_ON_ACCESS = "off"
+# Risk score (see assessRisk in index.js) at which a request is "suspicious".
+SUSPICION_THRESHOLD = "3"
+CHALLENGE_TIMEOUT = "5000"
+CHALLENGE_MAX_RETRIES = "2"
+CHALLENGE_FALLBACK_ON_ERROR_CREATE = "false"
+CHALLENGE_FALLBACK_ON_ERROR_ACCESS = "true"
 
 # Secrets are never stored here. Set them with:
-#   npx wrangler secret put SAFE_BROWSING_API_KEY
+#   npx wrangler secret put TURNSTILE_SECRET_KEY
+#   npx wrangler secret put SAFE_BROWSING_API_KEY   (optional)
+#   npx wrangler secret put API_TOKEN               (optional, lets scripts skip the challenge)
+#
+# For local development put Cloudflare's always-passing test keys in .dev.vars
+# (git-ignored):
+#   TURNSTILE_SITE_KEY=1x00000000000000000000AA
+#   TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
