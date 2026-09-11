@@ -434,6 +434,7 @@ function page(title, body) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>${escapeHtml(title)}</title>
 <style>${PAGE_STYLE}</style>
 </head>
@@ -841,7 +842,7 @@ async function route(request, env, cfg) {
     return jsonResponse({ status: 405, error: "Method not allowed" }, 405, cfg);
   }
   if (url.pathname === "/") return serveHomepage(request, env, cfg);
-  if (url.pathname === "/favicon.ico" || url.pathname === "/robots.txt") {
+  if (url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico" || url.pathname === "/robots.txt") {
     if (env.ASSETS) {
       const asset = await env.ASSETS.fetch(request);
       if (asset.ok) return asset;
