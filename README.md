@@ -4,7 +4,7 @@ A URL shortener running on Cloudflare Workers, with adaptive bot protection via 
 
 - Short links are stored in Workers KV and served with a plain `302` redirect.
 - Bot protection is adaptive: requests are risk-scored and only suspicious ones (tool user agents, missing browser headers, too many creations per minute) have to pass a Turnstile challenge. Ordinary visitors never see it.
-- The homepage is a static file in [`public/`](public/) served through Workers Static Assets. No HTML is fetched from third-party sites at request time.
+- The homepage is a single dependency-free file in [`public/`](public/) served through Workers Static Assets. It loads no third-party code unless a Turnstile check is required, supports dark mode, and keeps a per-browser list of recent links.
 - Every setting is an environment variable. Secrets are Worker secrets, never source code.
 - Redirects carry `Referrer-Policy: no-referrer` (configurable) so destinations do not learn where visitors came from.
 - Submitted URLs are validated with the URL parser; anything that is not a plain absolute `http`/`https` URL is refused.

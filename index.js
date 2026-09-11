@@ -202,7 +202,7 @@ export function validateTargetUrl(input, { maxLength = 2048, selfHostname = "" }
   if (raw.length === 0) return { ok: false, error: "url is required" };
   if (raw.length > maxLength) return { ok: false, error: `url is longer than ${maxLength} characters` };
   // eslint-disable-next-line no-control-regex
-  if (/[ - ]/.test(raw)) return { ok: false, error: "url contains whitespace or control characters" };
+  if (/[\u0000-\u0020\u007f]/.test(raw)) return { ok: false, error: "url contains whitespace or control characters" };
   // These are invalid in URLs and are what HTML/JS injection payloads rely on.
   if (/[<>"`]/.test(raw)) return { ok: false, error: "url contains characters that are not allowed" };
 
@@ -386,19 +386,46 @@ function redirectResponse(location, cfg) {
 // Page templates (all interpolated values are escaped)
 // ---------------------------------------------------------------------------
 
+// Shares its design tokens with public/index.html so every page looks like one product.
 const PAGE_STYLE = `
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; min-height: 100vh;
-         display: flex; align-items: center; justify-content: center; background: #f5f5f7; color: #1d1d1f; }
-  .card { background: #fff; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.08); padding: 2rem; max-width: 480px; width: calc(100% - 2rem); text-align: center; }
-  h1 { font-size: 1.4rem; margin: 0 0 .75rem; }
-  p { color: #6e6e73; margin: 0 0 1rem; line-height: 1.5; }
-  code { word-break: break-all; }
-  a.button { display: inline-block; background: #007aff; color: #fff; text-decoration: none; padding: .6rem 1.2rem; border-radius: 8px; }
-  a.button.danger { background: #ff3b30; }
-  .url { word-break: break-all; font-family: ui-monospace, monospace; font-size: .9rem; background: #f5f5f7; padding: .75rem; border-radius: 8px; margin-bottom: 1.25rem; }
+  :root { --bg:#f4f5f9; --card:#fff; --text:#14161f; --muted:#646b7a; --line:#e3e6ee; --field:#f8f9fc;
+          --accent:#4f46e5; --accent-hover:#4338ca; --accent-soft:#eef0ff; --accent-text:#3730a3;
+          --danger:#dc2626; --danger-soft:#fef2f2; --glow-a:rgba(79,70,229,.18); --glow-b:rgba(236,72,153,.12);
+          --shadow:0 24px 60px -24px rgba(20,22,31,.28); --ring:0 0 0 4px rgba(79,70,229,.18); }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1017; --card:#161925; --text:#eef0f6; --muted:#9aa2b5; --line:#262a38; --field:#0f1219;
+            --accent:#7c74ff; --accent-hover:#9089ff; --accent-soft:#1f1e3d; --accent-text:#c7c3ff;
+            --danger:#f87171; --danger-soft:#2a1516; --glow-a:rgba(124,116,255,.22); --glow-b:rgba(236,72,153,.14);
+            --shadow:0 24px 60px -24px rgba(0,0,0,.7); --ring:0 0 0 4px rgba(124,116,255,.28); }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 20px;
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif; line-height: 1.5; color: var(--text);
+         background: radial-gradient(60vw 60vw at 10% -10%, var(--glow-a), transparent 60%),
+                     radial-gradient(50vw 50vw at 100% 110%, var(--glow-b), transparent 60%), var(--bg); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
+          padding: 32px; max-width: 480px; width: 100%; text-align: center; }
+  .mark { width: 44px; height: 44px; border-radius: 12px; background: var(--accent); margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; }
+  h1 { font-size: 1.35rem; letter-spacing: -.01em; margin: 0 0 .5rem; }
+  p { color: var(--muted); margin: 0 0 1rem; }
+  a { color: var(--accent-text); }
+  .url { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; text-align: left;
+         background: var(--field); border: 1px solid var(--line); padding: .75rem; border-radius: 10px; margin-bottom: 1.25rem; }
+  .btn, a.button { display: inline-flex; align-items: center; justify-content: center; height: 46px; padding: 0 20px; font: inherit; font-weight: 600;
+                   color: #fff; background: var(--accent); border: 0; border-radius: 10px; text-decoration: none; cursor: pointer; }
+  .btn:hover, a.button:hover { background: var(--accent-hover); }
+  .btn:focus-visible, a.button:focus-visible, .input:focus { outline: none; box-shadow: var(--ring); }
+  a.button.danger { background: var(--danger); }
+  a.button.ghost { color: var(--accent-text); background: var(--accent-soft); }
+  .input { width: 100%; height: 50px; padding: 0 14px; font: inherit; color: var(--text); background: var(--field);
+           border: 1.5px solid var(--line); border-radius: 10px; margin-bottom: 12px; }
+  .input:focus { border-color: var(--accent); background: var(--card); }
   .widget { display: flex; justify-content: center; min-height: 65px; margin: 1rem 0; }
-  @media (prefers-color-scheme: dark) { body { background: #000; color: #f5f5f7; } .card { background: #1c1c1e; } .url { background: #2c2c2e; } p { color: #a1a1a6; } }
+  .out { margin-top: 1rem; word-break: break-all; }
+  @media (prefers-reduced-motion: no-preference) { .card { animation: rise .45s cubic-bezier(.2,.8,.2,1) both; } @keyframes rise { from { opacity: 0; transform: translateY(12px); } } }
 `;
+
+const PAGE_MARK = `<div class="mark" aria-hidden="true"><svg width="26" height="26" viewBox="0 0 32 32" fill="none"><path d="M11 13.5a4.5 4.5 0 0 1 4.5-4.5h1a4.5 4.5 0 0 1 0 9h-1" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M21 18.5a4.5 4.5 0 0 1-4.5 4.5h-1a4.5 4.5 0 0 1 0-9h1" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg></div>`;
 
 function page(title, body) {
   return `<!DOCTYPE html>
@@ -406,11 +433,13 @@ function page(title, body) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>${escapeHtml(title)}</title>
 <style>${PAGE_STYLE}</style>
 </head>
 <body>
 <div class="card">
+${PAGE_MARK}
 ${body}
 </div>
 </body>
@@ -418,7 +447,7 @@ ${body}
 }
 
 function notFoundPage() {
-  return page("404 Not Found", `<h1>404 Not Found</h1><p>The short link you requested does not exist or has expired.</p>`);
+  return page("404 Not Found", `<h1>This link doesn't exist</h1><p>It may have expired or been typed incorrectly.</p><a class="button ghost" href="/">Create a short link</a>`);
 }
 
 function errorPage() {
@@ -429,7 +458,7 @@ function unsafeUrlPage(destination) {
   const safe = escapeHtml(destination);
   return page(
     "Warning: risky destination",
-    `<h1>&#9888; This link looks dangerous</h1>
+    `<h1>This link looks dangerous</h1>
 <p>Google Safe Browsing flagged the destination as malware, phishing or unwanted software. Proceed only if you trust it.</p>
 <div class="url">${safe}</div>
 <a class="button danger" href="${safe}" rel="noreferrer noopener">Continue anyway</a>`,
@@ -443,14 +472,14 @@ function siteKeyForHtml(cfg) {
 
 function challengePage(cfg) {
   const body = `
-<h1>&#128274; Quick check</h1>
-<p>This link is protected. Please complete the verification to continue.</p>
-<div id="turnstile" class="widget"></div>
+<h1>One quick check</h1>
+<p>This link is protected. Complete the verification below and you'll be on your way.</p>
+<div id="turnstile-box" class="widget"></div>
 <p id="status" hidden>Verifying and redirecting&hellip;</p>
 <script src="${TURNSTILE_SCRIPT}?onload=onTurnstileLoad&render=explicit" async defer></script>
 <script>
   function onTurnstileLoad() {
-    turnstile.render("#turnstile", {
+    turnstile.render("#turnstile-box", {
       sitekey: "${siteKeyForHtml(cfg)}",
       callback: function (token) {
         document.getElementById("status").hidden = false;
@@ -467,7 +496,7 @@ function challengePage(cfg) {
 function challengeFailedPage(message, retryPath) {
   return page(
     "Verification failed",
-    `<h1>&#10060; Verification failed</h1><p>${escapeHtml(message)}</p><a class="button" href="${escapeHtml(retryPath)}">Try again</a>`,
+    `<h1>Verification failed</h1><p>${escapeHtml(message)}</p><a class="button" href="${escapeHtml(retryPath)}">Try again</a>`,
   );
 }
 
@@ -483,17 +512,17 @@ function fallbackHomepage(cfg) {
   const body = `
 <h1>Tyrion URL Shortener</h1>
 <form id="f">
-  <p><input id="url" type="url" required placeholder="https://example.com/very/long/link" style="width:100%;padding:.6rem;border:1px solid #ccc;border-radius:8px;box-sizing:border-box"></p>
-  <div id="turnstile" class="widget" hidden></div>
-  <p><button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:#007aff;color:#fff">Shorten</button></p>
+  <input id="url" class="input" type="url" required placeholder="https://example.com/very/long/link" autofocus>
+  <div id="turnstile-box" class="widget" hidden></div>
+  <button type="submit" class="btn">Shorten</button>
 </form>
-<p id="out"></p>
+<p id="out" class="out"></p>
 <script>
   var SITE_KEY = "${siteKeyForHtml(cfg)}";
   var token = null, widgetId = null, pending = null;
   function loadTurnstile() {
     return new Promise(function (resolve, reject) {
-      if (window.turnstile) return resolve();
+      if (window.turnstile && typeof window.turnstile.render === "function") return resolve();
       var s = document.createElement("script");
       s.src = "${TURNSTILE_SCRIPT}?render=explicit";
       s.async = true; s.onload = resolve; s.onerror = reject;
@@ -501,7 +530,7 @@ function fallbackHomepage(cfg) {
     });
   }
   async function challenge() {
-    var box = document.getElementById("turnstile");
+    var box = document.getElementById("turnstile-box");
     box.hidden = false;
     await loadTurnstile();
     if (widgetId !== null) { turnstile.reset(widgetId); return; }
@@ -726,7 +755,7 @@ async function handleCreate(request, env, cfg) {
 async function serveHomepage(request, env, cfg) {
   const headers = {
     "Content-Type": "text/html; charset=utf-8",
-    "Content-Security-Policy": turnstileCsp(["https://cdn.tailwindcss.com"]),
+    "Content-Security-Policy": turnstileCsp(),
     "Cache-Control": "public, max-age=300",
     ...BASE_SECURITY_HEADERS,
   };
